@@ -1,0 +1,4 @@
+anthropic>=0.40
+python-dotenv>=1.0
+# 1인 무역 공용 DB 패키지 (편집 모드)
+-e ../trade_hub
