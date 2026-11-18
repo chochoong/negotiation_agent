@@ -231,20 +231,26 @@ def counter(quote_id, tone="normal", price=None, note=None, other_quotes_note=No
 # ---------------------------------------------------------------------------
 # 받은 답장
 # ---------------------------------------------------------------------------
-def add_reply(ps_id, text, analyze=True, conn=None):
-    """사람이 붙여넣은 답장을 저장하고 (기본) 바로 분석한다. 저장은 분석이 실패해도 남는다."""
+def add_reply(ps_id, text, analyze=True, conn=None, subject=None, sent_at=None, external_id=None, thread_id=None):
+    """사람이 붙여넣은(또는 Gmail에서 가져온) 답장을 저장하고 (기본) 바로 분석한다. 저장은 분석이 실패해도 남는다."""
     conn = conn or db.connect()
     ps = get_ps(conn, ps_id)
     text = (text or "").strip()
     if not text:
         raise ValueError("답장 내용이 비어 있습니다")
-    prev = last_sent(conn, ps_id)
+    prev = None
+    if thread_id:      # 같은 Gmail 대화에서 마지막으로 보낸 메일에 대한 답장
+        prev = conn.execute("SELECT * FROM messages WHERE product_supplier_id = ? AND direction = 'outbound' "
+                            "AND status = 'sent' AND external_thread_id = ? ORDER BY id DESC LIMIT 1",
+                            (ps_id, thread_id)).fetchone()
+    prev = prev or last_sent(conn, ps_id)
     with conn:
         mid = conn.execute(
-            "INSERT INTO messages (product_supplier_id, direction, kind, channel, body, status, reply_to_id, sent_at)"
-            " VALUES (?, 'inbound', 'other', ?, ?, 'received', ?, ?)",
-            (ps_id, thread_channel(conn, ps), text, prev["id"] if prev else None, db.now())).lastrowid
-    log(f"📥 답장 #{mid} 저장 — {ps['company']}")
+            "INSERT INTO messages (product_supplier_id, direction, kind, channel, subject, body, status, reply_to_id,"
+            " sent_at, external_id, external_thread_id) VALUES (?, 'inbound', 'other', ?, ?, ?, 'received', ?, ?, ?, ?)",
+            (ps_id, "email" if external_id else thread_channel(conn, ps), subject, text, prev["id"] if prev else None,
+             sent_at or db.now(), external_id, thread_id)).lastrowid
+    log(f"📥 답장 #{mid} 저장 — {ps['company']}" + (f" · {subject}" if subject else ""))
     print(f"RESULT_ANCHOR=ps-{ps_id}", flush=True)
     if analyze:
         analyze_replies([mid], conn=conn)
@@ -287,7 +293,7 @@ def _analyze(conn, run, rows):
             continue
         done.append(_save_analysis(conn, run.id, ps, m, out))
     if errors:
-        raise RuntimeError(f"답장 {len(errors)}건 분석 실패: {errors} — `python -m comm_agent analyze {' '.join(map(str, errors))}`로 다시")
+        raise RuntimeError(f"답장 {len(errors)}건 분석 실패: {errors} — `python -m negotiation_agent analyze {' '.join(map(str, errors))}`로 다시")
     return done
 
 
@@ -379,14 +385,22 @@ def _followups(conn, run, rows, note=None):
 # 슈퍼바이저용: 분석 안 된 답장 + 후속 메일 (RFQ·역제안은 사람이 버튼으로)
 # ---------------------------------------------------------------------------
 def auto(days=FOLLOWUP_DAYS, conn=None):
+    from . import gmail
     conn = conn or db.connect()
+    use_gmail = gmail.configured()
     replies, due = conn.execute(PENDING_REPLY_SQL).fetchall(), due_followups(conn, days)
     log(f"공용 DB: {db.default_path()}")
-    log(f"분석할 답장 {len(replies)}건 · 후속 메일 필요 {len(due)}건")
-    if not replies and not due:
+    log(f"분석할 답장 {len(replies)}건 · 후속 메일 필요 {len(due)}건" + (" · Gmail 확인" if use_gmail else ""))
+    if not replies and not due and not use_gmail:
         return {}
     result, errors = {}, []
-    with _run(conn, {"action": "auto", "days": days}) as run:
+    with _run(conn, {"action": "auto", "days": days, "gmail": use_gmail}) as run:
+        if use_gmail:       # Gmail에서 발송 확인·새 답장 가져오기 → 그 결과로 할 일을 다시 계산 (답장 온 곳엔 후속 X)
+            try:
+                result["gmail"] = gmail.sync(conn)
+            except Exception as err:
+                errors.append(f"Gmail: {err}")
+            replies, due = conn.execute(PENDING_REPLY_SQL).fetchall(), due_followups(conn, days)
         for key, fn, rows in (("followups", _followups, due), ("analyzed", _analyze, replies)):
             if not rows:
                 continue
@@ -406,7 +420,8 @@ MARKS = {"approved": {"draft"}, "sent": {"draft", "approved"}, "discarded": {"dr
          "draft": {"approved"}}
 
 
-def mark(message_id, status, conn=None):
+def mark(message_id, status, conn=None, sent_at=None, external_id=None, how="사람"):
+    """sent_at·external_id·how 는 Gmail 동기화가 '사람이 Gmail에서 보낸 것'을 확인했을 때 쓴다."""
     conn = conn or db.connect()
     m = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
     if m is None or m["direction"] != "outbound":
@@ -417,8 +432,8 @@ def mark(message_id, status, conn=None):
         raise ValueError(f"#{message_id}은(는) 이미 '{m['status']}' 상태라 '{status}'(으)로 바꿀 수 없습니다")
     ps = get_ps(conn, m["product_supplier_id"])
     with conn:
-        conn.execute("UPDATE messages SET status = ?, sent_at = ? WHERE id = ?",
-                     (status, db.now() if status == "sent" else None, message_id))
+        conn.execute("UPDATE messages SET status = ?, sent_at = ?, external_id = COALESCE(?, external_id) WHERE id = ?",
+                     (status, (sent_at or db.now()) if status == "sent" else None, external_id, message_id))
         task_status = {"sent": "done", "discarded": "dismissed"}.get(status)
         if task_status:
             conn.execute("UPDATE tasks SET status = ?, done_at = ? WHERE kind = 'send_message' AND ref_table = 'messages'"
@@ -427,6 +442,6 @@ def mark(message_id, status, conn=None):
             advance_ps_status(conn, ps["id"], "contacted")
             if ps["stage"] == "sourcing":      # 첫 메일 발송 = 협상 시작 (사람이 보냈으므로 run_id 없음)
                 db.advance_stage(conn, ps["product_id"], "negotiating", None,
-                                 f"{ps['company']}에 {KIND_LABEL.get(m['kind'], '메일')} 발송 (사람)")
+                                 f"{ps['company']}에 {KIND_LABEL.get(m['kind'], '메일')} 발송 ({how})")
     log(f"#{message_id} → {status} ({ps['company']})")
     print(f"RESULT_ANCHOR=ps-{ps['id']}", flush=True)

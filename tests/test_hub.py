@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-from comm_agent import __main__ as cli
-from comm_agent import hub, llm, private
+from negotiation_agent import __main__ as cli
+from negotiation_agent import hub, llm, private
 from trade_hub import db
 
 
