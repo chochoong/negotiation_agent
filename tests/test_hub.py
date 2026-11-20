@@ -117,11 +117,35 @@ def test_reply_analysis_saves_quote_and_counter(conn, ps, fake_llm):
     assert (c["kind"], c["reply_to_id"], json.loads(c["analysis_json"])["tone"]) == ("negotiation", mid, "firm")
 
 
-def test_non_usd_reply_becomes_task_not_quote(conn, ps, fake_llm):
+def test_non_usd_reply_without_rate_becomes_task_not_quote(conn, ps, fake_llm):
     fake_llm["reply"] = {**REPLY, "currency": "CNY", "unit_price": 22}
     hub.add_reply(ps["id"], "单价 22 元", conn=conn)
     assert conn.execute("SELECT COUNT(*) FROM quotes").fetchone()[0] == 0
     assert "CNY" in conn.execute("SELECT title FROM tasks WHERE kind = 'review_quote'").fetchone()[0]
+
+
+def test_non_usd_reply_converted_with_rate(conn, ps, fake_llm, monkeypatch):
+    monkeypatch.setenv("FX_RATES", "CNY=7.0, EUR=0.9")
+    fake_llm["reply"] = {**REPLY, "currency": "RMB", "unit_price": 21, "price_tiers": [{"qty": 1000, "price": 14}],
+                         "sample_cost": 70}
+    hub.add_reply(ps["id"], "单价 21 元", conn=conn)
+    q = conn.execute("SELECT * FROM quotes").fetchone()
+    assert (q["unit_price_usd"], q["sample_cost_usd"]) == (3.0, 10.0)
+    assert json.loads(q["price_tiers_json"]) == [{"qty": 1000, "usd": 2.0}]
+    assert "21 CNY" in q["notes"] and "7" in q["notes"]
+    assert "원래 21 CNY" in conn.execute("SELECT title FROM tasks WHERE kind = 'review_quote'").fetchone()[0]
+
+
+def test_reanalysis_updates_quote_instead_of_duplicating(conn, ps, fake_llm):
+    fake_llm["reply"] = REPLY
+    mid = hub.add_reply(ps["id"], "Price is $3.2", conn=conn)
+    fake_llm["reply"] = {**REPLY, "unit_price": 3.1}
+    hub.analyze_replies([mid], conn=conn)
+    hub.analyze_replies([mid], conn=conn)
+    quotes = conn.execute("SELECT * FROM quotes").fetchall()
+    assert len(quotes) == 1 and quotes[0]["unit_price_usd"] == 3.1
+    tasks = conn.execute("SELECT status FROM tasks WHERE kind = 'review_quote' ORDER BY id").fetchall()
+    assert [t[0] for t in tasks] == ["dismissed", "dismissed", "pending"]
 
 
 def test_failed_analysis_is_recorded_not_retried(conn, ps, fake_llm):

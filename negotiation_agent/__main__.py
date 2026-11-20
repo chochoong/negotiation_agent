@@ -8,6 +8,8 @@
   python -m negotiation_agent followup [메일번호 ...] [--days 3]   # 답 없는 보낸 메일에 후속 메일 초안
   python -m negotiation_agent auto [--days 3]                      # 슈퍼바이저용: 답장 분석 + 후속 메일
   python -m negotiation_agent mark <메일번호> approved|sent|discarded|draft   # 사람이 검토·발송·버림 표시
+  python -m negotiation_agent sample <연결번호> [--qty "2 pcs"] [--note ...] [--lang en|zh]   # 샘플 요청 초안
+  python -m negotiation_agent supplier <연결번호> select|reject|restore [--reason ...]   # 공급처 선정·제외·되돌리기
   python -m negotiation_agent target <품목번호> [--target 2.8] [--max 3.5] [--payment "T/T 30/70"]  # 내부 전용 기준가
   python -m negotiation_agent gmail-login                         # 구글 로그인 (한 번, 브라우저가 열림)
   python -m negotiation_agent gmail-draft <메일번호> [--to a@b.com]  # 초안을 Gmail 임시보관함에 넣기 (발송 X)
@@ -64,6 +66,17 @@ def build_parser():
     s = sub.add_parser("mark", help="초안 검토·발송·버림 표시 (사람)")
     s.add_argument("message_id", type=int)
     s.add_argument("status", choices=["approved", "sent", "discarded", "draft"])
+
+    s = sub.add_parser("sample", help="샘플 요청 초안")
+    s.add_argument("ps_id", type=int)
+    s.add_argument("--qty")
+    s.add_argument("--note")
+    s.add_argument("--lang")
+
+    s = sub.add_parser("supplier", help="공급처 선정·제외·되돌리기 (사람)")
+    s.add_argument("ps_id", type=int)
+    s.add_argument("action", choices=list(("select", "reject", "restore")))
+    s.add_argument("--reason", help="제외 사유")
 
     s = sub.add_parser("target", help="내부 전용 목표가·상한가 (공용 DB에 저장하지 않음)")
     s.add_argument("product_id", type=int, nargs="?")
@@ -147,6 +160,10 @@ def main(argv=None):
             hub.auto(a.days or hub.FOLLOWUP_DAYS, conn=conn)
         elif a.cmd == "mark":
             hub.mark(a.message_id, a.status, conn=conn)
+        elif a.cmd == "sample":
+            hub.sample(a.ps_id, a.qty, a.note, a.lang, conn=conn)
+        elif a.cmd == "supplier":
+            hub.supplier(a.ps_id, a.action, a.reason, conn=conn)
         elif a.cmd == "target":
             if a.product_id is None:
                 for r in private.all_rows():

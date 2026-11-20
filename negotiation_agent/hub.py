@@ -5,12 +5,16 @@
 
 이 에이전트가 쓰는 곳 (trade_hub/schema.sql 머리말):
   messages, quotes, tasks(send_message·review_quote),
-  product_suppliers.status (candidate→contacted→quoted, 앞으로만),
+  product_suppliers.status (candidate→contacted→quoted→sampling, 앞으로만 / 선정·제외·되돌리기는 사람 버튼),
+  product_suppliers.reject_reason (제외 사유), product_suppliers.supplier_specs_json (공급처가 답한 사양 → 3번이 읽음,
+    db.merge_supplier_specs 로만),
   products.stage sourcing→negotiating (사람이 첫 메일을 '발송 완료'로 표시할 때만)
 내부 상한가는 공용 DB에 두지 않는다 → private.py
 """
 import json
+import os
 import sys
+import urllib.request
 from datetime import datetime
 
 from trade_hub import db
@@ -125,6 +129,38 @@ def last_sent(conn, ps_id):
                         "AND status = 'sent' ORDER BY id DESC LIMIT 1", (ps_id,)).fetchone()
 
 
+def _spec_values(flag):
+    rule = db.SPEC_FLAG_KEYS[flag]
+    if rule is bool:
+        return "true|false"
+    if rule is str:
+        return "ISO 3166-1 alpha-2 country code, e.g. CN"
+    return "|".join(rule)
+
+
+def spec_questions(conn, ps, unanswered_only=True):
+    """3번(통관·규제)이 최신 판정에서 '공급처에 물어볼 것'으로 남긴 사양 질문 [{"flag", "question_ko"}].
+    unanswered_only: 이 공급처가 이미 답한(supplier_specs_json.flags 에 값이 있는) 항목은 뺀다."""
+    check = db.latest_compliance_check(conn, ps["product_id"])
+    if check is None or "supplier_questions_json" not in check.keys():
+        return []
+    qs = _loads(check["supplier_questions_json"], [])
+    specs = _loads(ps["supplier_specs_json"], {}) if "supplier_specs_json" in ps.keys() else {}
+    answered = (specs or {}).get("flags") or {} if isinstance(specs, dict) else {}
+    out, seen = [], set()
+    for q in qs if isinstance(qs, list) else []:
+        if not isinstance(q, dict):
+            continue
+        flag, text = q.get("flag"), str(q.get("question_ko") or "").strip()
+        if flag not in db.SPEC_FLAG_KEYS or not text or flag in seen:
+            continue
+        if unanswered_only and answered.get(flag) is not None:
+            continue
+        seen.add(flag)
+        out.append({"flag": flag, "question_ko": text})
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 쓰기 도우미
 # ---------------------------------------------------------------------------
@@ -158,8 +194,44 @@ def save_draft(conn, run_id, ps, kind, language, out, reply_to=None, analysis=No
     return mid
 
 
+# ---------------------------------------------------------------------------
+# 환율 (USD가 아닌 견적 → 견적표에는 USD로 환산해 넣고, 원래 금액·환율은 quotes.notes 에)
+#   .env FX_RATES="CNY=7.1,EUR=0.86" (1 USD 당 그 통화) 가 있으면 그 값, 없으면 공개 환율 API (통화 코드만 보냄)
+# ---------------------------------------------------------------------------
+FX_URL = "https://open.er-api.com/v6/latest/USD"
+CURRENCY_ALIAS = {"RMB": "CNY", "YUAN": "CNY", "元": "CNY", "¥": "CNY", "€": "EUR", "£": "GBP", "￥": "CNY"}
+_fx_cache = {}
+
+
+def fx_rate(currency):
+    """1 USD = ? currency. (rate, 출처) 또는 (None, 이유)."""
+    cur = CURRENCY_ALIAS.get(currency, currency)
+    for part in (os.getenv("FX_RATES") or "").split(","):
+        k, _, v = part.partition("=")
+        if k.strip().upper() == cur and _num(v.strip()):
+            return _num(v.strip()), ".env FX_RATES"
+    if "rates" not in _fx_cache:
+        try:
+            with urllib.request.urlopen(FX_URL, timeout=8) as r:
+                data = json.loads(r.read().decode())
+            _fx_cache["rates"] = data.get("rates") or {}
+            _fx_cache["date"] = (data.get("time_last_update_utc") or "")[:16]
+        except Exception as err:
+            return None, f"환율을 가져오지 못함 ({type(err).__name__})"
+    rate = _num(_fx_cache["rates"].get(cur))
+    return (rate, f"open.er-api.com {_fx_cache.get('date', '')}".strip()) if rate else (None, f"{cur} 환율 없음")
+
+
 def _run(conn, args):
     return db.agent_run(conn, AGENT, provider=llm.PROVIDER, model=llm.MODEL, args=args)
+
+
+def _check_active(ps):
+    """끝난 품목·제외한 공급처에는 새 초안을 만들지 않는다."""
+    if ps["stage"] in db.TERMINAL_STAGES:
+        raise ValueError(f"품목 #{ps['product_id']}은(는) {ps['stage']} 상태입니다")
+    if ps["status"] == "rejected":
+        raise ValueError(f"{ps['company']}은(는) 제외한 공급처입니다 (되돌리려면 supplier {ps['id']} restore)")
 
 
 # ---------------------------------------------------------------------------
@@ -168,13 +240,13 @@ def _run(conn, args):
 def rfq(ps_id, quantity=None, incoterm=None, language="en", note=None, force=False, conn=None):
     conn = conn or db.connect()
     ps = get_ps(conn, ps_id)
-    if ps["stage"] in db.TERMINAL_STAGES:
-        raise ValueError(f"품목 #{ps['product_id']}은(는) {ps['stage']} 상태입니다")
+    _check_active(ps)
     pending = conn.execute("SELECT id FROM messages WHERE product_supplier_id = ? AND kind = 'rfq' "
                            "AND status IN ('draft', 'approved', 'sent')", (ps_id,)).fetchone()
     if pending and not force:
         raise ValueError(f"이 공급처에는 이미 견적 요청 메일(#{pending['id']})이 있습니다. 새로 만들려면 --force")
     qty = quantity or (f"{ps['max_order_qty']} pcs (first order)" if ps["max_order_qty"] else None)
+    specs = spec_questions(conn, ps)
     user = json.dumps({
         "supplier_name": ps["company"], "supplier_country": ps["country"], "contact_name": ps["contact_name"],
         "product_ko": ps["product"], "product_en": ps["search_keyword_en"] or ps["product"],
@@ -183,11 +255,14 @@ def rfq(ps_id, quantity=None, incoterm=None, language="en", note=None, force=Fal
         "questions_to_ask": _loads(ps["first_questions_json"], []),
         "unverified_points": _loads(ps["unverified_json"], []),
         "required_certifications": ps["regulations"], "extra_notes": note or None,
+        "product_spec_questions_ko": [q["question_ko"] for q in specs],
     }, ensure_ascii=False)
     with _run(conn, {"action": "rfq", "ps_id": ps_id, "language": language}) as run:
-        log(f"▶ 견적 요청 초안: [{ps['product_id']}] {ps['product']} → {ps['company']}")
+        log(f"▶ 견적 요청 초안: [{ps['product_id']}] {ps['product']} → {ps['company']}"
+            + (f" · 3번 사양 질문 {len(specs)}개" if specs else ""))
         out = llm.complete_json(prompts.RFQ_SYSTEM.format(language=LANGS.get(language, language)), user)
-        return save_draft(conn, run.id, ps, "rfq", language, out)
+        return save_draft(conn, run.id, ps, "rfq", language, out,
+                          analysis={"spec_flags_asked": [q["flag"] for q in specs]} if specs else None)
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +276,7 @@ def counter(quote_id, tone="normal", price=None, note=None, other_quotes_note=No
     if q is None:
         raise ValueError(f"견적 번호 {quote_id}가 없습니다")
     ps = get_ps(conn, q["product_supplier_id"])
+    _check_active(ps)
     cfg = private.get(ps["product_id"])
     price = _num(price) or cfg.get("target_price_usd")
     if price and cfg.get("max_price_usd") and price > cfg["max_price_usd"]:
@@ -279,8 +355,11 @@ def _analyze(conn, run, rows):
         log(f"▶ 답장 분석 #{m['id']} — {ps['company']}")
         prev = conn.execute("SELECT subject, body FROM messages WHERE id = ?", (m["reply_to_id"],)).fetchone() \
             if m["reply_to_id"] else None
+        asked = spec_questions(conn, ps, unanswered_only=False)    # 이미 답한 항목도 — 공급처가 고쳐 말할 수 있음
         user = json.dumps({"product": ps["search_keyword_en"] or ps["product"], "supplier": ps["company"],
                            "our_previous_message": (f"{prev['subject']}\n\n{prev['body']}"[:3000] if prev else None),
+                           "spec_questions": [{"flag": q["flag"], "question_ko": q["question_ko"],
+                                               "allowed_values": _spec_values(q["flag"])} for q in asked],
                            "reply": m["body"]}, ensure_ascii=False)
         try:
             out = llm.complete_json(prompts.REPLY_SYSTEM, user)
@@ -291,45 +370,99 @@ def _analyze(conn, run, rows):
                              (db.dumps({"error": f"{type(err).__name__}: {err}"[:500]}), m["id"]))
             log(f"  ✗ 분석 실패: {err}")
             continue
-        done.append(_save_analysis(conn, run.id, ps, m, out))
+        done.append(_save_analysis(conn, run.id, ps, m, out, {q["flag"] for q in asked}))
     if errors:
         raise RuntimeError(f"답장 {len(errors)}건 분석 실패: {errors} — `python -m negotiation_agent analyze {' '.join(map(str, errors))}`로 다시")
     return done
 
 
-def _save_analysis(conn, run_id, ps, m, out):
+def _spec_answers(out, asked, message_id):
+    """LLM이 뽑은 사양 답 → (flags, evidence). 물어본 항목만, 값 형식이 맞는 것만 (애매하면 LLM이 빼도록 프롬프트에서 막음)."""
+    flags, evidence = {}, []
+    for a in out.get("spec_answers") or []:
+        if not isinstance(a, dict) or a.get("flag") not in asked or a["flag"] in flags:
+            continue
+        flag, value = a["flag"], a.get("value")
+        if db.SPEC_FLAG_KEYS[flag] is str and isinstance(value, str):
+            value = value.strip().upper()
+        if not db._spec_value_ok(flag, value):
+            continue
+        flags[flag] = value
+        claim = str(a.get("claim_ko") or "").strip() or f"{flag} = {value}"
+        evidence.append({"claim": f"{flag}: {claim}"[:300], "message_id": message_id})
+    return flags, evidence
+
+
+def _save_analysis(conn, run_id, ps, m, out, asked=frozenset()):
+    """분석 결과 저장. 같은 답장을 다시 분석하면 그 답장의 견적을 고치고(새로 만들지 않음) 대기 중인 검토 할 일을 바꾼다."""
     keys = ("unit_price", "currency", "min_qty", "price_tiers", "incoterm", "lead_time_days", "payment_terms",
             "sample_cost", "sample_shipping", "valid_until")
     analysis = {"summary_ko": out.get("summary_ko"), "open_questions_ko": out.get("open_questions_ko") or [],
                 "extracted": {k: out.get(k) for k in keys}}
-    price, cur = _num(out.get("unit_price")), (out.get("currency") or "").upper() or None
+    price, cur = _num(out.get("unit_price")), (out.get("currency") or "").strip().upper() or None
+    cur = CURRENCY_ALIAS.get(cur, cur)
+    flags, evidence = _spec_answers(out, asked, m["id"])
+    if flags:
+        analysis["spec_answers"] = flags
+
+    rate, fx_note = None, None       # 1 USD = rate cur. USD가 아니면 환산, 환율을 못 구하면 견적표 대신 할 일로
+    if price is not None and cur == "USD":
+        rate = 1.0
+    elif price is not None and cur:
+        rate, src = fx_rate(cur)
+        if rate:
+            fx_note = f"원래 견적 {price:g} {cur} — 환율 1 USD = {rate:g} {cur} ({src}) 적용, 확인 필요"
+            analysis["fx"] = {"currency": cur, "unit_price": price, "rate": rate, "source": src}
+        else:
+            fx_note = src
+
+    def usd(v):
+        return None if v is None or not rate else round(v / rate, 4)
+
+    old = conn.execute("SELECT id FROM quotes WHERE message_id = ? ORDER BY id", (m["id"],)).fetchall()
     quote_id = None
     with conn:
         conn.execute("UPDATE messages SET translation = ?, language = COALESCE(language, ?), analysis_json = ? WHERE id = ?",
                      (out.get("translation_ko"), out.get("language"), db.dumps(analysis), m["id"]))
-        if price is not None and cur == "USD":
-            tiers = [{"qty": _int(t.get("qty")), "usd": _num(t.get("price"))} for t in out.get("price_tiers") or []
+        # 다시 분석: 이 답장으로 만든 대기 중 검토 할 일은 닫고 새로 만든다 (중복 방지)
+        for table, rid in [("messages", m["id"])] + [("quotes", q["id"]) for q in old]:
+            conn.execute("UPDATE tasks SET status = 'dismissed', done_at = ? WHERE kind = 'review_quote' "
+                         "AND ref_table = ? AND ref_id = ? AND status = 'pending'", (db.now(), table, rid))
+        if flags:
+            db.merge_supplier_specs(conn, ps["id"], flags, evidence)
+            log("  🔎 공급처가 답한 사양 기록 (3번 참고): " + ", ".join(f"{k}={v}" for k, v in flags.items()))
+        if price is not None and rate:
+            price_usd = usd(price)
+            tiers = [{"qty": _int(t.get("qty")), "usd": usd(_num(t.get("price")))} for t in out.get("price_tiers") or []
                      if isinstance(t, dict) and _num(t.get("price")) is not None]
             inco = (out.get("incoterm") or "").upper()
-            quote_id = conn.execute(
-                "INSERT INTO quotes (product_supplier_id, message_id, run_id, unit_price_usd, min_qty, price_tiers_json,"
-                " incoterm, lead_time_days, payment_terms, sample_cost_usd, sample_shipping_usd, valid_until)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ps["id"], m["id"], run_id, price, _int(out.get("min_qty")), db.dumps(tiers or None),
-                 inco if inco in INCOTERMS else None, _int(out.get("lead_time_days")), out.get("payment_terms"),
-                 _num(out.get("sample_cost")), _num(out.get("sample_shipping")),
-                 out.get("valid_until"))).lastrowid
+            vals = (price_usd, _int(out.get("min_qty")), db.dumps(tiers or None), inco if inco in INCOTERMS else None,
+                    _int(out.get("lead_time_days")), out.get("payment_terms"), usd(_num(out.get("sample_cost"))),
+                    usd(_num(out.get("sample_shipping"))), out.get("valid_until"), fx_note)
+            cols = ("unit_price_usd, min_qty, price_tiers_json, incoterm, lead_time_days, payment_terms, "
+                    "sample_cost_usd, sample_shipping_usd, valid_until, notes")
+            if old:
+                quote_id = old[0]["id"]
+                conn.execute(f"UPDATE quotes SET ({cols}) = (?, ?, ?, ?, ?, ?, ?, ?, ?, ?), run_id = ? WHERE id = ?",
+                             (*vals, run_id, quote_id))
+            else:
+                quote_id = conn.execute(
+                    f"INSERT INTO quotes (product_supplier_id, message_id, run_id, {cols})"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (ps["id"], m["id"], run_id, *vals)).lastrowid
             advance_ps_status(conn, ps["id"], "quoted")
             moq = f" / MOQ {_int(out.get('min_qty'))}" if out.get("min_qty") else ""
-            db.add_task(conn, "review_quote", f"[{ps['product']}] {ps['company']} 견적 검토 — ${price:g}{moq}",
+            orig = f" (원래 {price:g} {cur})" if fx_note else ""
+            db.add_task(conn, "review_quote", f"[{ps['product']}] {ps['company']} 견적 검토 — ${price_usd:g}{moq}{orig}",
                         product_id=ps["product_id"], run_id=run_id, ref_table="quotes", ref_id=quote_id,
-                        detail=analysis["summary_ko"], priority=2)
-            log(f"  💾 견적 #{quote_id}: ${price:g}{moq}")
+                        detail=" ".join(x for x in (fx_note, analysis["summary_ko"]) if x), priority=2)
+            log(f"  💾 견적 #{quote_id}{' (다시 분석 → 고침)' if old else ''}: ${price_usd:g}{moq}{orig}")
         elif price is not None:
+            why = fx_note or "통화 미상"
             db.add_task(conn, "review_quote", f"[{ps['product']}] {ps['company']} 견적 확인 — {price:g} {cur or '통화 미상'}",
                         product_id=ps["product_id"], run_id=run_id, ref_table="messages", ref_id=m["id"],
-                        detail="USD가 아니어서 견적표에 넣지 않았습니다. " + (analysis["summary_ko"] or ""), priority=2)
-            log(f"  · 가격 {price:g} {cur or '통화 미상'} — USD가 아니어서 견적표 대신 할 일로 남김")
+                        detail=f"USD로 바꾸지 못해 견적표에 넣지 않았습니다 ({why}). " + (analysis["summary_ko"] or ""),
+                        priority=2)
+            log(f"  · 가격 {price:g} {cur or '통화 미상'} — USD로 바꾸지 못해 견적표 대신 할 일로 남김 ({why})")
         else:
             log("  · 가격 정보 없음 (요약만 저장)")
     return {"message_id": m["id"], "quote_id": quote_id}
@@ -338,8 +471,16 @@ def _save_analysis(conn, run_id, ps, m, out):
 # ---------------------------------------------------------------------------
 # 후속 메일
 # ---------------------------------------------------------------------------
+BLOCKED_TITLE = "후속 메일 자동 생성 막힘"     # tasks.title 머리 — 이 할 일이 있는 메일은 자동 후속에서 뺀다
+
+
 def due_followups(conn, days=FOLLOWUP_DAYS, max_followups=MAX_FOLLOWUPS):
-    return conn.execute(FOLLOWUP_DUE_SQL, {"days": days, "max": max_followups}).fetchall()
+    """후속 메일이 필요한 보낸 메일. 상한가 검사에 두 번 막혀 할 일로 넘긴 메일은 빼고(사람이 버튼으로 직접),
+    슈퍼바이저 when_sql 은 이 차이를 모른다 — 그 경우 auto 가 실행돼도 할 일이 없어 그냥 끝난다."""
+    rows = conn.execute(FOLLOWUP_DUE_SQL, {"days": days, "max": max_followups}).fetchall()
+    blocked = {r[0] for r in conn.execute("SELECT ref_id FROM tasks WHERE ref_table = 'messages' AND kind = 'other' "
+                                          "AND title LIKE ?", (f"%{BLOCKED_TITLE}%",))}
+    return [r for r in rows if r["id"] not in blocked]
 
 
 def followups(ids=None, days=FOLLOWUP_DAYS, note=None, conn=None):
@@ -354,25 +495,47 @@ def followups(ids=None, days=FOLLOWUP_DAYS, note=None, conn=None):
         log("후속 메일이 필요한 메일이 없습니다.")
         return []
     with _run(conn, {"action": "followup", "ids": [r["id"] for r in rows]}) as run:
-        return _followups(conn, run, rows, note)
+        return _followups(conn, run, rows, note, manual=bool(ids))
 
 
-def _followups(conn, run, rows, note=None):
+def _followups(conn, run, rows, note=None, manual=False):
     out_ids, errors = [], []
     for m in rows:
         ps = get_ps(conn, m["product_supplier_id"])
+        if ps["stage"] in db.TERMINAL_STAGES or ps["status"] == "rejected":
+            log(f"  · 건너뜀: {ps['company']} (끝난 품목이거나 제외한 공급처)")
+            continue
         count = conn.execute("SELECT COUNT(*) FROM messages WHERE reply_to_id = ? AND kind = 'follow_up' "
                              "AND status = 'sent'", (m["id"],)).fetchone()[0]
         days = (datetime.now() - datetime.fromisoformat(m["sent_at"])).days
         log(f"▶ 후속 메일 초안: {ps['company']} — 메일 #{m['id']} {days}일째 답 없음 (후속 {count}회 보냄)")
         language = m["language"] or thread_language(conn, ps["id"])
+        specs = spec_questions(conn, ps)
         user = json.dumps({"supplier_name": ps["company"], "contact_name": ps["contact_name"],
                            "previous_message": f"{m['subject'] or ''}\n\n{m['body']}"[:3000],
-                           "days_since_sent": days, "follow_up_count": count, "extra_notes": note or None},
+                           "days_since_sent": days, "follow_up_count": count, "extra_notes": note or None,
+                           "product_spec_questions_ko": [q["question_ko"] for q in specs]},
                           ensure_ascii=False)
+        system = prompts.FOLLOWUP_SYSTEM.format(language=LANGS.get(language, language))
+        analysis = {"spec_flags_asked": [q["flag"] for q in specs]} if specs else None
         try:
-            out = llm.complete_json(prompts.FOLLOWUP_SYSTEM.format(language=LANGS.get(language, language)), user)
-            out_ids.append(save_draft(conn, run.id, ps, "follow_up", language, out, reply_to=m["id"]))
+            try:
+                out = llm.complete_json(system, user)
+                out_ids.append(save_draft(conn, run.id, ps, "follow_up", language, out, reply_to=m["id"], analysis=analysis))
+            except DraftRejected:            # 우연히 상한가와 같은 숫자 → 숫자 없이 한 번 더
+                log("  · 상한가와 같은 숫자가 나와 숫자 없이 다시 생성")
+                out = llm.complete_json(system + prompts.NO_NUMBERS_RETRY, user)
+                out_ids.append(save_draft(conn, run.id, ps, "follow_up", language, out, reply_to=m["id"], analysis=analysis))
+        except DraftRejected as err:         # 두 번 막힘 → 자동으로는 다시 하지 않고 사람에게 (버튼으로 직접 만들 수 있음)
+            log(f"  ✗ {err}")
+            if not manual:
+                with conn:
+                    db.add_task(conn, "other", f"[{ps['product']}] {ps['company']} {BLOCKED_TITLE} — 메일 #{m['id']}",
+                                product_id=ps["product_id"], run_id=run.id, ref_table="messages", ref_id=m["id"],
+                                detail="초안에 내부 상한가와 같은 숫자가 두 번 나와 저장하지 않았습니다. "
+                                       "필요하면 5번 페이지 [후속 메일 초안]으로 직접 만드세요. 자동 후속은 이 메일에 더 하지 않습니다.",
+                                priority=2)
+            errors.append(m["id"])
         except Exception as err:      # 이 메일만 건너뛰고 다음 메일 계속
             errors.append(m["id"])
             log(f"  ✗ 실패: {err}")
@@ -439,9 +602,81 @@ def mark(message_id, status, conn=None, sent_at=None, external_id=None, how="사
             conn.execute("UPDATE tasks SET status = ?, done_at = ? WHERE kind = 'send_message' AND ref_table = 'messages'"
                          " AND ref_id = ? AND status = 'pending'", (task_status, db.now(), message_id))
         if status == "sent":
-            advance_ps_status(conn, ps["id"], "contacted")
+            advance_ps_status(conn, ps["id"], "sampling" if m["kind"] == "sample" else "contacted")
             if ps["stage"] == "sourcing":      # 첫 메일 발송 = 협상 시작 (사람이 보냈으므로 run_id 없음)
                 db.advance_stage(conn, ps["product_id"], "negotiating", None,
                                  f"{ps['company']}에 {KIND_LABEL.get(m['kind'], '메일')} 발송 ({how})")
     log(f"#{message_id} → {status} ({ps['company']})")
     print(f"RESULT_ANCHOR=ps-{ps['id']}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# 샘플 요청 (로드맵 3단계)
+# ---------------------------------------------------------------------------
+def sample(ps_id, quantity=None, note=None, language=None, address_note=None, conn=None):
+    """샘플 요청 초안 (messages.kind='sample'). 사람이 보내면 공급처 상태가 '샘플'(sampling)로."""
+    conn = conn or db.connect()
+    ps = get_ps(conn, ps_id)
+    _check_active(ps)
+    pending = conn.execute("SELECT id FROM messages WHERE product_supplier_id = ? AND kind = 'sample' "
+                           "AND status IN ('draft', 'approved')", (ps_id,)).fetchone()
+    if pending:
+        raise ValueError(f"이 공급처에는 검토 대기 중인 샘플 요청 초안(#{pending['id']})이 있습니다")
+    q = conn.execute("SELECT * FROM quotes WHERE product_supplier_id = ? ORDER BY id DESC LIMIT 1", (ps_id,)).fetchone()
+    language = language or thread_language(conn, ps_id)
+    specs = spec_questions(conn, ps)
+    user = json.dumps({
+        "supplier_name": ps["company"], "contact_name": ps["contact_name"],
+        "product_en": ps["search_keyword_en"] or ps["product"],
+        "sample_quantity": quantity or "1-2 pcs",
+        "their_quote": ({"unit_price_usd": q["unit_price_usd"], "min_qty": q["min_qty"],
+                         "sample_cost_usd": q["sample_cost_usd"], "sample_shipping_usd": q["sample_shipping_usd"]}
+                        if q else None),
+        "shipping_destination": "South Korea", "shipping_note": address_note or None,
+        "extra_notes": note or None,
+        "product_spec_questions_ko": [x["question_ko"] for x in specs],
+    }, ensure_ascii=False)
+    with _run(conn, {"action": "sample", "ps_id": ps_id, "language": language}) as run:
+        log(f"▶ 샘플 요청 초안: [{ps['product_id']}] {ps['product']} → {ps['company']}")
+        out = llm.complete_json(prompts.SAMPLE_SYSTEM.format(language=LANGS.get(language, language)), user)
+        analysis = {"spec_flags_asked": [x["flag"] for x in specs]} if specs else None
+        return save_draft(conn, run.id, ps, "sample", language, out,
+                          reply_to=q["message_id"] if q else None, analysis=analysis)
+
+
+# ---------------------------------------------------------------------------
+# 공급처 선정 / 제외 / 되돌리기 (사람 버튼 — LLM 없음, run_id 없음)
+# ---------------------------------------------------------------------------
+SUPPLIER_ACTIONS = {"select": "선정", "reject": "제외", "restore": "되돌리기"}
+
+
+def _natural_status(conn, ps_id):
+    """메일·견적 기록으로 본 원래 진행 상태 (되돌리기용)."""
+    sent = {r[0] for r in conn.execute("SELECT kind FROM messages WHERE product_supplier_id = ? AND direction = 'outbound' "
+                                       "AND status = 'sent'", (ps_id,))}
+    if "sample" in sent:
+        return "sampling"
+    if conn.execute("SELECT 1 FROM quotes WHERE product_supplier_id = ?", (ps_id,)).fetchone():
+        return "quoted"
+    return "contacted" if sent else "candidate"
+
+
+def supplier(ps_id, action, reason=None, conn=None):
+    """select: 이 공급처로 진행 (status='selected') / reject: 제외 (+사유, 이후 초안·자동 후속 안 함) /
+    restore: 선정·제외 취소 → 메일·견적 기록대로. 다른 공급처는 건드리지 않는다."""
+    if action not in SUPPLIER_ACTIONS:
+        raise ValueError(f"동작은 {', '.join(SUPPLIER_ACTIONS)} 중 하나")
+    conn = conn or db.connect()
+    ps = get_ps(conn, ps_id)
+    reason = " ".join((reason or "").split())[:300] or None
+    status = {"select": "selected", "reject": "rejected"}.get(action) or _natural_status(conn, ps_id)
+    with conn:
+        conn.execute("UPDATE product_suppliers SET status = ?, reject_reason = ?, updated_at = ? WHERE id = ?",
+                     (status, reason if action == "reject" else None, db.now(), ps_id))
+        if action == "reject":       # 제외한 공급처의 대기 중 발송 할 일은 닫음 (초안 자체는 남김 — 사람이 버림 처리)
+            conn.execute("UPDATE tasks SET status = 'dismissed', done_at = ? WHERE kind = 'send_message' AND status = 'pending'"
+                         " AND ref_table = 'messages' AND ref_id IN (SELECT id FROM messages WHERE product_supplier_id = ?)",
+                         (db.now(), ps_id))
+    log(f"{ps['company']} → {SUPPLIER_ACTIONS[action]} ({ps['status']} → {status})" + (f" · 사유: {reason}" if reason else ""))
+    print(f"RESULT_ANCHOR=ps-{ps_id}", flush=True)
+    return status

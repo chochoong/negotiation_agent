@@ -59,21 +59,48 @@ def all_rows() -> list[dict]:
         return [dict(r) for r in conn.execute("SELECT * FROM negotiation_settings ORDER BY product_id")]
 
 
+# 상한가와 같은 숫자라도 바로 뒤에 이런 단위가 오면 가격이 아니라 수량·기간·크기로 보고 넘어간다 (오탐 줄이기).
+# 가격으로 읽힐 수 있는 숫자(통화 표시, 단위 없음)는 그대로 막는다 — 보수적으로.
+NON_PRICE_UNIT = re.compile(
+    r"\s*(?:(?:pcs|pc|pieces?|units?|sets?|pairs?|cartons?|ctns?|boxes|days?|weeks?|months?|years?|yrs?|hours?|hrs?|"
+    r"percent|cm|mm|m|meters?|inch(?:es)?|in|kg|g|grams?|lbs?|ml|l|liters?|w|watts?|v|volts?|mah)\b|%|"
+    r"개월|개|일|주|달|년|시간|세트|박스|장|켤레|센티|미리|"
+    r"个|件|套|天|周|月|年|箱|只|双|小时|厘米|毫米|公斤|克)", re.I)
+
+
+def _is_non_price(text, start, end):
+    """숫자 text[start:end] 가 수량·기간·크기·목록 번호면 True. 앞에 통화 표시가 있으면 항상 가격으로 본다."""
+    before = text[max(0, start - 6):start]
+    if re.search(r"(\$|usd|us\$|rmb|cny|¥|￥|€|eur|달러|원|元)\s*$", before, re.I):
+        return False
+    after = text[end:end + 12]
+    if re.match(r"\s*(\$|usd|dollars?|rmb|cny|元|美元|달러|불)", after, re.I):
+        return False
+    if NON_PRICE_UNIT.match(after):
+        return True
+    line_start = text.rfind("\n", 0, start) + 1      # 목록 번호: 줄 맨 앞의 "3. " / "3) "
+    return bool(re.fullmatch(r"\s*", text[line_start:start]) and re.match(r"[.)]\s", text[end:end + 2]))
+
+
 def leaks_max_price(text: str, product_id: int | None = None) -> bool:
-    """글에 내부 상한가와 같은 숫자가 있으면 True.
+    """글에 내부 상한가와 같은 숫자가 (가격으로 읽힐 수 있게) 있으면 True.
 
     product_id 가 None 이면 등록된 모든 품목의 상한가로 검사한다(보수적).
     '1,000' / '1000.00' / '3.5.' 같은 표기 차이는 숫자로 바꿔 비교한다.
+    같은 숫자라도 '50 pcs'·'3 days'·'20%'·목록 번호 '3.' 처럼 가격이 아닌 게 분명하면 넘어간다 (통화 표시가 붙으면 막음).
     """
     rows = [get(product_id)] if product_id is not None else all_rows()
     limits = [r["max_price_usd"] for r in rows if r and r.get("max_price_usd")]
     if not limits or not text:
         return False
-    for raw in re.findall(r"\d[\d,]*\.?\d*", text):
+    for mt in re.finditer(r"\d[\d,]*\.?\d*", text):
+        raw = mt.group()
         try:
             n = float(raw.replace(",", "").rstrip("."))
         except ValueError:
             continue
         if any(abs(n - mp) < 1e-9 for mp in limits):
-            return True
+            end = mt.end() - (1 if raw.endswith(".") else 0)
+            if not _is_non_price(text, mt.start(), end):
+                return True
     return False
