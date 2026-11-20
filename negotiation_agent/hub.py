@@ -49,9 +49,13 @@ WHERE m.direction = 'outbound' AND m.status = 'sent' AND m.kind != 'follow_up' A
   AND NOT EXISTS (SELECT 1 FROM messages f WHERE f.reply_to_id = m.id AND f.kind = 'follow_up'
                   AND f.status IN ('draft', 'approved', 'discarded'))
   AND (SELECT COUNT(*) FROM messages f WHERE f.reply_to_id = m.id AND f.kind = 'follow_up' AND f.status = 'sent') < :max
-  AND julianday('now', 'localtime') - julianday(COALESCE(
-        (SELECT MAX(f.sent_at) FROM messages f WHERE f.reply_to_id = m.id AND f.kind = 'follow_up' AND f.status = 'sent'),
-        m.sent_at)) >= :days
+  -- 예정일: 사람이 캘린더에서 옮긴 날짜(followup_due_on, trade_hub v15 calendar_sync가 씀)가 마지막 후속 발송보다
+  --   뒤면 그 날부터, 아니면 마지막 발송(원래 메일 또는 후속) 뒤 :days 일
+  AND (CASE WHEN m.followup_due_on IS NOT NULL AND m.followup_due_on > COALESCE(date((SELECT MAX(f.sent_at) FROM messages f
+                 WHERE f.reply_to_id = m.id AND f.kind = 'follow_up' AND f.status = 'sent')), '')
+            THEN date('now', 'localtime') >= m.followup_due_on
+            ELSE julianday('now', 'localtime') - julianday(COALESCE((SELECT MAX(f.sent_at) FROM messages f
+                 WHERE f.reply_to_id = m.id AND f.kind = 'follow_up' AND f.status = 'sent'), m.sent_at)) >= :days END)
 ORDER BY m.id"""
 
 PENDING_REPLY_SQL = "SELECT * FROM messages WHERE direction = 'inbound' AND analysis_json IS NULL ORDER BY id"

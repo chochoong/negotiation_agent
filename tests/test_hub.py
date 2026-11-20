@@ -227,3 +227,24 @@ def test_cli_reply_file_and_mark(conn, ps, fake_llm, tmp_path, capsys):
     assert not f.exists() and f"RESULT_ANCHOR=ps-{ps['id']}" in capsys.readouterr().out
     assert cli.main(["mark", "999", "sent"]) == 1
     assert cli.main(["status"]) == 0
+
+
+def test_followup_due_follows_calendar_date(conn, ps, fake_llm):
+    """trade_hub v15: 사람이 캘린더에서 후속 예정일을 옮기면(followup_due_on) 그 날짜를 따른다."""
+    sent = hub.rfq(ps["id"], conn=conn)
+    hub.mark(sent, "sent", conn=conn)
+    _age(conn, sent, 4)
+    with conn:
+        conn.execute("UPDATE messages SET followup_due_on = date('now', 'localtime', '+2 days') WHERE id = ?", (sent,))
+    assert hub.due_followups(conn) == []                        # 3일 지났지만 뒤로 미룸
+    with conn:
+        conn.execute("UPDATE messages SET followup_due_on = date('now', 'localtime') WHERE id = ?", (sent,))
+    assert [r["id"] for r in hub.due_followups(conn)] == [sent]
+    with conn:                                                  # 앞당김: 보낸 지 하루여도 예정일이 오늘이면 대상
+        conn.execute("UPDATE messages SET sent_at = datetime('now', 'localtime', '-1 days') WHERE id = ?", (sent,))
+    assert [r["id"] for r in hub.due_followups(conn)] == [sent]
+    f1 = hub.followups([sent], conn=conn)[0]                     # 후속을 보내면 그보다 앞선 예정일은 무효 → 다시 3일 규칙
+    hub.mark(f1, "sent", conn=conn)
+    assert hub.due_followups(conn) == []
+    _age(conn, f1, 4)
+    assert [r["id"] for r in hub.due_followups(conn)] == [sent]
