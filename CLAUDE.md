@@ -23,6 +23,9 @@
 - negotiation_agent/hub.py — rfq, add_reply/analyze_replies, counter, followups, auto, mark, sample, supplier (공용 DB 기록)
   · 3번 사양 질문 spec_questions / 답 _spec_answers, 환율 fx_rate (.env FX_RATES 또는 open.er-api.com)
 - negotiation_agent/private.py — 내부 목표가·상한가 (로컬 전용). leaks_max_price: 같은 숫자라도 수량·기간·크기·목록 번호면 통과
+  · 4번 cost_agent 가 이 파일을 직접 읽어 견적 기준 목표가·포기 가격(=상한가)을 set_(product_id, target, max_price)로 넣는다
+    (사람이 target 으로 넣은 값은 안 덮음, 설정 ../cost_agent/config/hub.yaml negotiation). get·set_ 시그니처를 바꾸지 말 것
+    (tests/test_private_contract.py). 견적 요청 초안에는 목표가를 넣지 않는다 — 역제안 단계에서만 씀
 - negotiation_agent/prompts.py — 프롬프트
 - negotiation_agent/llm.py — LLM 호출 (모델 교체는 여기서만, .env 는 이 폴더)
 - negotiation_agent/gmail.py — Gmail: 초안 → 임시보관함(push_draft), 발송 확인·답장 가져오기(sync). messages.external_* 칸(trade_hub v9)
