@@ -117,17 +117,68 @@ def _draft_exists(svc, draft_id):
 # ---------------------------------------------------------------------------
 # 초안 → Gmail 임시보관함 (발송 X)
 # ---------------------------------------------------------------------------
-def _thread_info(svc, thread_id):
-    """대화의 마지막 메일 Message-ID·제목 (답장 형식으로 이어 붙이기용)."""
+def _thread_info(svc, thread_id, me=""):
+    """대화의 마지막 메일 Message-ID·제목 (답장 형식으로 이어 붙이기용) + 상대 주소 (받는 사람 기본값)."""
     t = svc.users().threads().get(userId="me", id=thread_id, format="metadata",
-                                  metadataHeaders=["Message-ID", "Subject", "References"]).execute()
-    msgs = t.get("messages") or []
+                                  metadataHeaders=["Message-ID", "Subject", "References", "From", "To"]).execute()
+    msgs = [x for x in t.get("messages") or [] if "DRAFT" not in (x.get("labelIds") or [])]
     if not msgs:
         return None
     last = msgs[-1]
     h = _headers(last)
+    peer = None                                # 상대가 마지막으로 보낸 주소, 없으면 우리가 마지막으로 보낸 받는 사람
+    for x in reversed(msgs):
+        hx = _headers(x)
+        frm = parseaddr(hx.get("from", ""))[1].lower()
+        if "SENT" not in (x.get("labelIds") or []) and frm and frm != me:
+            peer = frm
+            break
+        if "SENT" in (x.get("labelIds") or []) and hx.get("to"):
+            peer = hx["to"]
+            break
     return {"message_id": h.get("message-id"), "references": h.get("references"),
-            "subject": _headers(msgs[0]).get("subject")}
+            "subject": _headers(msgs[0]).get("subject"), "peer": peer}
+
+
+EMAIL_RE = re.compile(r"^[^@\s,;<>\"]+@[^@\s,;<>\"]+\.[^@\s,;<>\"]+$")
+MAX_TO = 5
+
+
+FIND_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+
+
+def find_emails(*texts):
+    """공급처 연락처 칸들(contact_email, contact_other)에서 메일 주소를 모두 뽑는다 (중복 제거, 소문자).
+    'info@a.com / fiona@a.com' 처럼 여러 개가 한 칸에 있어도, 메모 속에 섞여 있어도 찾는다."""
+    out = []
+    for t in texts:
+        for addr in FIND_EMAIL_RE.findall(t or ""):
+            addr = addr.lower().rstrip(".")
+            if addr not in out:
+                out.append(addr)
+    return out[:MAX_TO]
+
+
+def supplier_emails(ps):
+    keys = ps.keys()
+    return find_emails(*(ps[k] for k in ("contact_email", "contact_other") if k in keys))
+
+
+def parse_recipients(text):
+    """'a@x.com, b@y.com' → ['a@x.com', 'b@y.com']. 형식이 틀리면 ValueError (대시보드에 한 줄로 표시)."""
+    out = []
+    for part in re.split(r"[,;]+", (text or "").strip()):
+        part = part.strip()
+        if not part:
+            continue
+        addr = parseaddr(part)[1] if "<" in part else part
+        if not EMAIL_RE.match(addr):
+            raise ValueError(f"메일 주소 형식이 아닙니다: {part}")
+        if addr.lower() not in (x.lower() for x in out):
+            out.append(addr)
+    if len(out) > MAX_TO:
+        raise ValueError(f"받는 사람은 {MAX_TO}명까지 넣을 수 있습니다.")
+    return out
 
 
 def _reply_subject(subject):
@@ -135,30 +186,43 @@ def _reply_subject(subject):
     return s if re.match(r"(?i)^re\s*:", s) else f"Re: {s}"
 
 
-def push_draft(message_id, conn=None, svc=None):
-    """DB 초안(messages) 하나를 Gmail 임시보관함에 넣는다. 같은 공급처와의 Gmail 대화가 있으면 그 대화의 답장으로."""
+def push_draft(message_id, conn=None, svc=None, to=None):
+    """DB 초안(messages) 하나를 Gmail 임시보관함에 넣는다. 같은 공급처와의 Gmail 대화가 있으면 그 대화의 답장으로.
+
+    받는 사람: to(직접 입력) → 공급처 연락처(contact_email·contact_other)에 있는 메일 주소 전부 → 같은 대화의 상대 주소.
+      셋 다 없으면 비워 둠 (Gmail에서 입력).
+    이미 임시보관함에 있는 초안에 to 를 주면 그 초안의 받는 사람만 바꾼다(drafts.update — 발송 아님).
+    """
     conn = conn or db.connect()
     m = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
     if m is None or m["direction"] != "outbound":
         raise ValueError(f"보낼 메일 초안 #{message_id}이(가) 없습니다")
     if m["status"] not in ("draft", "approved"):
         raise ValueError(f"#{message_id}은(는) '{m['status']}' 상태라 임시보관함에 넣지 않습니다 (초안·검토 완료만)")
+    typed = parse_recipients(to)
     ps = hub.get_ps(conn, m["product_supplier_id"])
     if any(private.leaks_max_price(t or "", ps["product_id"]) for t in (m["subject"], m["body"])):
         raise hub.DraftRejected("초안에 내부 상한가와 같은 숫자가 있어 Gmail에 넣지 않았습니다.")
     svc = svc or service()
-    if m["external_draft_id"] and _draft_exists(svc, m["external_draft_id"]):
-        raise ValueError(f"#{message_id}은(는) 이미 Gmail 임시보관함에 있습니다. Gmail에서 확인 후 직접 보내세요.")
+    existing = m["external_draft_id"] if m["external_draft_id"] and _draft_exists(svc, m["external_draft_id"]) else None
+    if existing and not typed:
+        raise ValueError(f"#{message_id}은(는) 이미 Gmail 임시보관함에 있습니다. Gmail에서 확인 후 직접 보내세요. "
+                         "(받는 사람을 바꾸려면 주소를 입력하세요)")
 
-    prev = conn.execute("SELECT external_thread_id FROM messages WHERE product_supplier_id = ? AND id != ? "
-                        "AND external_thread_id IS NOT NULL ORDER BY id DESC LIMIT 1",
-                        (ps["id"], message_id)).fetchone()
-    thread_id = prev["external_thread_id"] if prev else None
-    info = _thread_info(svc, thread_id) if thread_id else None
+    if existing and m["external_thread_id"]:   # 이미 넣은 초안: 그 초안이 속한 대화 기준
+        thread_id = m["external_thread_id"]
+    else:
+        prev = conn.execute("SELECT external_thread_id FROM messages WHERE product_supplier_id = ? AND id != ? "
+                            "AND external_thread_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+                            (ps["id"], message_id)).fetchone()
+        thread_id = prev["external_thread_id"] if prev else None
+    me = (svc.users().getProfile(userId="me").execute().get("emailAddress") or "").lower() if thread_id else ""
+    info = _thread_info(svc, thread_id, me) if thread_id else None
 
     msg = EmailMessage()
-    if ps["contact_email"]:
-        msg["To"] = ps["contact_email"]
+    recipients = ", ".join(typed or supplier_emails(ps)) or (info or {}).get("peer") or ""
+    if recipients:
+        msg["To"] = recipients
     subject = m["subject"] or ""
     if info:                                   # 같은 대화로 묶이려면 제목·In-Reply-To·References 가 맞아야 함
         subject = _reply_subject(info["subject"] or subject)
@@ -170,13 +234,16 @@ def push_draft(message_id, conn=None, svc=None):
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     body = {"message": {"raw": raw, **({"threadId": thread_id} if info else {})}}
 
-    with hub._run(conn, {"action": "gmail_draft", "message_id": message_id}):
-        d = svc.users().drafts().create(userId="me", body=body).execute()
+    with hub._run(conn, {"action": "gmail_draft", "message_id": message_id, "update": bool(existing)}):
+        if existing:                           # 받는 사람만 바꿈 — Gmail에서 고친 본문은 DB 원문으로 되돌아감
+            d = svc.users().drafts().update(userId="me", id=existing, body={"id": existing, **body}).execute()
+        else:
+            d = svc.users().drafts().create(userId="me", body=body).execute()
         with conn:
             conn.execute("UPDATE messages SET external_draft_id = ?, external_thread_id = ? WHERE id = ?",
                          (d["id"], d["message"].get("threadId"), message_id))
-    to = ps["contact_email"] or "받는 사람 비어 있음 — Gmail에서 입력"
-    hub.log(f"📨 Gmail 임시보관함에 넣음: #{message_id} → {to} · {subject}"
+    shown = recipients or "받는 사람 비어 있음 — Gmail에서 입력"
+    hub.log(f"📨 Gmail 임시보관함에 {'받는 사람 변경' if existing else '넣음'}: #{message_id} → {shown} · {subject}"
             + (" (기존 대화에 답장)" if info else ""))
     hub.log("   발송은 Gmail에서 직접 하세요. 보내면 다음 동기화 때 '보냄'으로 자동 표시됩니다.")
     print(f"RESULT_ANCHOR=ps-{ps['id']}", flush=True)
@@ -309,16 +376,17 @@ def _import_replies(conn, svc):
                 new.append(mid)
     # 2) 공급처 메일 주소에서 온 메일 (다른 대화로 답장한 경우). 우리가 메일을 보낸 뒤에 온 것만.
     rows = conn.execute("""
-        SELECT ps.id, LOWER(TRIM(s.contact_email)) AS email,
+        SELECT ps.id, s.contact_email, s.contact_other,
                MIN(m.sent_at) AS first_sent, MAX(m.sent_at) AS last_sent
         FROM product_suppliers ps JOIN suppliers s ON s.id = ps.supplier_id JOIN products p ON p.id = ps.product_id
         JOIN messages m ON m.product_supplier_id = ps.id AND m.direction = 'outbound' AND m.status = 'sent'
-        WHERE s.contact_email LIKE '%@%' AND ps.status != 'rejected' AND p.stage NOT IN ('closed', 'dropped')
+        WHERE (s.contact_email LIKE '%@%' OR s.contact_other LIKE '%@%') AND ps.status != 'rejected' AND p.stage NOT IN ('closed', 'dropped')
           AND m.sent_at IS NOT NULL
         GROUP BY ps.id""").fetchall()
     by_email = {}
     for r in rows:
-        by_email.setdefault(r["email"], []).append(r)
+        for addr in find_emails(r["contact_email"], r["contact_other"]):
+            by_email.setdefault(addr, []).append(r)
     for email, links in by_email.items():
         after = int((datetime.fromisoformat(min(r["first_sent"] for r in links)) - timedelta(days=1)).timestamp())
         page = svc.users().messages().list(userId="me", q=f"from:{email} after:{after}", maxResults=SEARCH_LIMIT).execute()

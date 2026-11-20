@@ -1,4 +1,4 @@
-"""3번 커뮤니케이션·협상 에이전트 — 공용 DB(trade_hub) 연동.
+"""5번 커뮤니케이션·협상 에이전트 — 공용 DB(trade_hub) 연동.
 
 2번이 찾은 공급처(product_suppliers)에 보낼 메일 초안을 만들고, 사람이 붙여넣은 답장을 분석해 견적(quotes)을 남긴다.
 메일은 절대 보내지 않는다: 초안(messages.status='draft')과 승인 대기함 할 일(tasks)만 만든다.

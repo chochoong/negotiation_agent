@@ -1,4 +1,4 @@
-"""3번 커뮤니케이션·협상 에이전트 명령.
+"""5번 커뮤니케이션·협상 에이전트 명령.
 
   python -m negotiation_agent status                              # 공급처별 메일·견적 현황, 처리 대기
   python -m negotiation_agent rfq <연결번호> [--qty "200 pcs"] [--incoterm FOB] [--lang en|zh] [--note ...]
@@ -10,10 +10,10 @@
   python -m negotiation_agent mark <메일번호> approved|sent|discarded|draft   # 사람이 검토·발송·버림 표시
   python -m negotiation_agent target <품목번호> [--target 2.8] [--max 3.5] [--payment "T/T 30/70"]  # 내부 전용 기준가
   python -m negotiation_agent gmail-login                         # 구글 로그인 (한 번, 브라우저가 열림)
-  python -m negotiation_agent gmail-draft <메일번호>               # 초안을 Gmail 임시보관함에 넣기 (발송 X)
+  python -m negotiation_agent gmail-draft <메일번호> [--to a@b.com]  # 초안을 Gmail 임시보관함에 넣기 (발송 X)
   python -m negotiation_agent gmail-sync                          # Gmail에서 발송 확인 + 새 답장 가져와 분석
 
-<연결번호> = 공용 DB product_suppliers.id (대시보드 3번 페이지에 표시). 메일은 절대 보내지 않습니다.
+<연결번호> = 공용 DB product_suppliers.id (대시보드 5번 페이지에 표시). 메일은 절대 보내지 않습니다.
 공용 DB 위치: 환경변수 TRADE_DB, 없으면 ../trade_hub/data/trade.db
 """
 import argparse
@@ -22,7 +22,7 @@ from pathlib import Path
 
 
 def build_parser():
-    ap = argparse.ArgumentParser(prog="negotiation_agent", description="3번 커뮤니케이션·협상 에이전트 (초안만 만듦)")
+    ap = argparse.ArgumentParser(prog="negotiation_agent", description="5번 커뮤니케이션·협상 에이전트 (초안만 만듦)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status", help="공급처별 메일·견적 현황")
 
@@ -74,6 +74,7 @@ def build_parser():
     sub.add_parser("gmail-login", help="Gmail 로그인 (브라우저) — 토큰을 data/gmail_token.json 에 저장")
     s = sub.add_parser("gmail-draft", help="초안을 Gmail 임시보관함에 넣기 (발송하지 않음)")
     s.add_argument("message_id", type=int)
+    s.add_argument("--to", help="받는 사람 (쉼표로 여러 명). 이미 넣은 초안이면 받는 사람만 바꿈")
     sub.add_parser("gmail-sync", help="Gmail에서 발송 확인 + 새 답장 가져와 분석")
     return ap
 
@@ -122,7 +123,7 @@ def main(argv=None):
     conn = db.connect()
     try:
         if a.cmd == "gmail-draft":
-            gmail.push_draft(a.message_id, conn=conn)
+            gmail.push_draft(a.message_id, conn=conn, to=a.to)
         elif a.cmd == "gmail-sync":
             gmail.sync_and_analyze(conn=conn)
         elif a.cmd == "status":

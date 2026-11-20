@@ -77,6 +77,15 @@ class FakeGmail:
                     return svc.dr[did]
                 return _Call(run)
 
+            def update(self, userId, id, body):
+                def run():
+                    old = svc.dr.pop(id)
+                    svc.msgs.pop(old["message"]["id"], None)
+                    d = self.create(userId, body).execute()      # 진짜 Gmail도 초안 id는 그대로, 메시지는 새로
+                    svc.dr[id] = svc.dr.pop(d["id"]) | {"id": id}
+                    return svc.dr[id]
+                return _Call(run)
+
             def get(self, userId, id, format=None):
                 def run():
                     if id not in svc.dr:
@@ -251,3 +260,34 @@ def test_auto_runs_gmail_sync_when_logged_in(conn, svc, fake_llm, tmp_path, monk
 def test_not_logged_in_message(conn):
     with pytest.raises(RuntimeError, match="gmail-login"):
         gmail.service()
+
+
+def test_recipient_typed_or_from_thread(conn, svc, fake_llm):
+    link = _ps(conn, email_addr=None)                       # 공급처 메일 주소 모름
+    mid = hub.rfq(link, conn=conn)
+    did = gmail.push_draft(mid, conn=conn)
+    assert svc.last_raw["To"] is None                        # 비워 둠
+    with pytest.raises(ValueError, match="이미 Gmail"):
+        gmail.push_draft(mid, conn=conn)
+    with pytest.raises(ValueError, match="형식"):
+        gmail.push_draft(mid, conn=conn, to="lily at abc")
+    assert gmail.push_draft(mid, conn=conn, to="Lily <lily@abc.cn>, sales@abc.cn") == did   # 받는 사람만 바꿈
+    assert svc.last_raw["To"] == "lily@abc.cn, sales@abc.cn" and len(svc.dr) == 1
+    assert _msg(conn, mid)["external_draft_id"] == did and _msg(conn, mid)["status"] == "draft"
+
+    # 보낸 뒤 공급처가 답장 → 후속 초안은 그 대화의 상대 주소가 기본 받는 사람
+    svc.send_from_gmail(did)
+    gmail.sync(conn)
+    svc.add_msg(_msg(conn, mid)["external_thread_id"], "Lily <lily@abc.cn>", "Will check.", ["INBOX"],
+                when=datetime.now() + timedelta(minutes=5))
+    nid = hub.rfq(link, force=True, conn=conn)
+    gmail.push_draft(nid, conn=conn)
+    assert svc.last_raw["To"] == "lily@abc.cn" and svc.last_raw["Subject"].startswith("Re: ")
+
+
+def test_recipient_auto_from_contact_fields(conn, svc, fake_llm):
+    link = _ps(conn, email_addr="info@abc.cn / Lily@ABC.cn")      # 한 칸에 여러 주소
+    with conn:
+        conn.execute("UPDATE suppliers SET contact_other = 'WeChat lily88, 메일 sales@abc.cn'")
+    gmail.push_draft(hub.rfq(link, conn=conn), conn=conn)
+    assert svc.last_raw["To"] == "info@abc.cn, lily@abc.cn, sales@abc.cn"

@@ -1,4 +1,4 @@
-"""3번 협상 에이전트 테스트 — 임시 공용 DB + 임시 private DB, LLM은 가짜 응답 (API 호출 없음)."""
+"""5번 협상 에이전트 테스트 — 임시 공용 DB + 임시 private DB, LLM은 가짜 응답 (API 호출 없음)."""
 import json
 
 import pytest
