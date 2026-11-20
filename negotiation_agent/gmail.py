@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 from email.utils import parseaddr
 from pathlib import Path
+from urllib.parse import quote
 
 from trade_hub import db
 
@@ -216,7 +217,7 @@ def push_draft(message_id, conn=None, svc=None, to=None):
                             "AND external_thread_id IS NOT NULL ORDER BY id DESC LIMIT 1",
                             (ps["id"], message_id)).fetchone()
         thread_id = prev["external_thread_id"] if prev else None
-    me = (svc.users().getProfile(userId="me").execute().get("emailAddress") or "").lower() if thread_id else ""
+    me = (svc.users().getProfile(userId="me").execute().get("emailAddress") or "").lower()
     info = _thread_info(svc, thread_id, me) if thread_id else None
 
     msg = EmailMessage()
@@ -247,7 +248,14 @@ def push_draft(message_id, conn=None, svc=None, to=None):
             + (" (기존 대화에 답장)" if info else ""))
     hub.log("   발송은 Gmail에서 직접 하세요. 보내면 다음 동기화 때 '보냄'으로 자동 표시됩니다.")
     print(f"RESULT_ANCHOR=ps-{ps['id']}", flush=True)
+    print(f"RESULT_URL={gmail_url(me, d['message'].get('id'))}", flush=True)   # 대시보드가 Gmail을 열어 줌
     return d["id"]
+
+
+def gmail_url(me="", message_id=None):
+    """Gmail 웹 주소: 임시보관함(+ 그 초안 열기). me 가 있으면 그 계정으로 (여러 계정 로그인 대비)."""
+    acct = f"?authuser={quote(me)}" if me else ""
+    return f"https://mail.google.com/mail/u/0/{acct}#drafts" + (f"?compose={quote(message_id)}" if message_id else "")
 
 
 # ---------------------------------------------------------------------------

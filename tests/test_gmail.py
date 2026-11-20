@@ -291,3 +291,12 @@ def test_recipient_auto_from_contact_fields(conn, svc, fake_llm):
         conn.execute("UPDATE suppliers SET contact_other = 'WeChat lily88, 메일 sales@abc.cn'")
     gmail.push_draft(hub.rfq(link, conn=conn), conn=conn)
     assert svc.last_raw["To"] == "info@abc.cn, lily@abc.cn, sales@abc.cn"
+
+
+def test_push_draft_prints_gmail_url_for_dashboard(conn, svc, fake_llm, capsys):
+    mid = hub.rfq(_ps(conn), conn=conn)
+    did = gmail.push_draft(mid, conn=conn)
+    url = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("RESULT_URL=")][0].split("=", 1)[1]
+    msg_id = svc.dr[did]["message"]["id"]
+    assert url.startswith("https://mail.google.com/mail/u/0/?authuser=") and url.endswith(f"#drafts?compose={msg_id}")
+    assert gmail.gmail_url() == "https://mail.google.com/mail/u/0/#drafts"
