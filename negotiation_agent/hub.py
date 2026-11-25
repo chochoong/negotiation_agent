@@ -13,6 +13,7 @@
 """
 import json
 import os
+import re
 import sys
 import urllib.request
 from datetime import datetime
@@ -331,6 +332,10 @@ def add_reply(ps_id, text, analyze=True, conn=None, subject=None, sent_at=None, 
             (ps_id, "email" if external_id else thread_channel(conn, ps), subject, text, prev["id"] if prev else None,
              sent_at or db.now(), external_id, thread_id)).lastrowid
     log(f"📥 답장 #{mid} 저장 — {ps['company']}" + (f" · {subject}" if subject else ""))
+    hits = bank_change_evidence(f"{subject or ''}\n{text}")
+    if hits:
+        with conn:
+            _bank_task(conn, ps, mid, hits)
     print(f"RESULT_ANCHOR=ps-{ps_id}", flush=True)
     if analyze:
         analyze_replies([mid], conn=conn)
@@ -380,6 +385,62 @@ def _analyze(conn, run, rows):
     return done
 
 
+def _place(out, incoterm):
+    """인코텀즈 지정장소: 공급처가 쓴 그대로 (없으면 None — 국가·도시로 추정하지 않음). 'FOB Ningbo'가 통째로 오면 규칙 글자는 뺀다."""
+    place = " ".join(str(out.get("incoterm_place") or "").split())
+    if incoterm and place.upper().startswith(incoterm + " "):
+        place = place[len(incoterm) + 1:].strip()
+    if not place or place.lower() in ("null", "none", "n/a", "-", "unknown", "tbd"):
+        return None
+    return place[:100]
+
+
+# ---------------------------------------------------------------------------
+# 계좌 변경 사기 경고: 받은 메일에 송금 계좌 안내·변경이 있으면 결제 할 일(최우선)로. 자동 답장·계좌 정보 저장은 하지 않는다.
+# ---------------------------------------------------------------------------
+BANK_TITLE = "⚠ 계좌 변경 요청 확인"
+BANK_RE = re.compile(
+    r"(?:new|changed?|change\s+of|updated?|different|another|alternative)\s+(?:our\s+)?"
+    r"(?:bank|banking|beneficiary|receiving|company)?\s*(?:account|bank\s+details|bank\s+info\w*|beneficiary)"
+    r"|(?:bank|account|banking|payment)\s+(?:details|information|info)\s+(?:has|have|had)\s+(?:been\s+)?(?:changed|updated)"
+    r"|changed\s+(?:our\s+)?bank"
+    r"|\b(?:swift(?:\s*code)?|iban|bic\s*code|beneficiary\s+(?:name|bank|account)|account\s+(?:no|number)\b)"
+    r"|(?:pay|remit|transfer|send)\w*\s+(?:the\s+\w+\s+)?to\s+(?:our\s+)?(?:new|another|this|the\s+following)\s+account"
+    r"|新(?:的)?(?:银行)?(?:账户|账号|帐户|帐号)|(?:更换|变更|更改|换了)\S{0,8}(?:账户|账号|帐户|帐号|银行)"
+    r"|收款(?:账户|账号|人|银行)|银行(?:账户|账号)?信息|开户行"
+    r"|(?:계좌|입금처)\S{0,6}(?:변경|바뀌|바꾸)|새\s*계좌|변경된\s*계좌|입금\s*계좌|수취인",
+    re.I)
+
+
+def bank_change_evidence(text):
+    """송금 계좌 안내·변경으로 보이는 문장들 (최대 3개, 각 200자). 없으면 []. 놓치지 않는 쪽으로 넓게 잡는다."""
+    out = []
+    for sent in re.split(r"(?<=[.!?。！？])\s+|\n+", text or ""):
+        if BANK_RE.search(sent) and sent.strip() not in out:
+            out.append(sent.strip())
+        if len(out) >= 3:
+            break
+    return [s[:200] for s in out]
+
+
+def _mask_numbers(s):
+    """근거 문장의 계좌번호·SWIFT·IBAN 같은 긴 숫자·코드는 가린다 (할 일에 송금 정보를 남기지 않음)."""
+    s = re.sub(r"\b[A-Z]{2}\d{2}[A-Z0-9 ]{10,30}\b", "[IBAN 가림]", s)
+    s = re.sub(r"\b[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b", "[코드 가림]", s)
+    return re.sub(r"\d[\d\s-]{5,}\d", "[숫자 가림]", s)
+
+
+def _bank_task(conn, ps, message_id, evidence, run_id=None):
+    """with conn: 안에서 부른다. 같은 메일에는 하나만 (db.add_task 가 ref 로 중복을 막음)."""
+    ev = " / ".join(_mask_numbers(e) for e in evidence if e and e.strip())[:600]
+    tid = db.add_task(conn, "payment", f"{BANK_TITLE}: {ps['company']}", product_id=ps["product_id"], run_id=run_id,
+                      ref_table="messages", ref_id=message_id, priority=1,
+                      detail="전화 등 다른 경로로 공급처에 직접 확인 전까지 송금 금지 (메일에 적힌 연락처로 확인하지 말 것). "
+                             + (f"근거 문장: {ev}" if ev else "답장 분석에서 계좌 안내가 감지됨"))
+    log(f"  ⚠ 계좌 안내·변경 문구 감지 → 결제 할 일 #{tid} (다른 경로로 확인 전 송금 금지)")
+    return tid
+
+
 def _spec_answers(out, asked, message_id):
     """LLM이 뽑은 사양 답 → (flags, evidence). 물어본 항목만, 값 형식이 맞는 것만 (애매하면 LLM이 빼도록 프롬프트에서 막음)."""
     flags, evidence = {}, []
@@ -399,8 +460,8 @@ def _spec_answers(out, asked, message_id):
 
 def _save_analysis(conn, run_id, ps, m, out, asked=frozenset()):
     """분석 결과 저장. 같은 답장을 다시 분석하면 그 답장의 견적을 고치고(새로 만들지 않음) 대기 중인 검토 할 일을 바꾼다."""
-    keys = ("unit_price", "currency", "min_qty", "price_tiers", "incoterm", "lead_time_days", "payment_terms",
-            "sample_cost", "sample_shipping", "valid_until")
+    keys = ("unit_price", "currency", "min_qty", "price_tiers", "incoterm", "incoterm_place", "lead_time_days",
+            "payment_terms", "sample_cost", "sample_shipping", "valid_until")
     analysis = {"summary_ko": out.get("summary_ko"), "open_questions_ko": out.get("open_questions_ko") or [],
                 "extracted": {k: out.get(k) for k in keys}}
     price, cur = _num(out.get("unit_price")), (out.get("currency") or "").strip().upper() or None
@@ -432,6 +493,9 @@ def _save_analysis(conn, run_id, ps, m, out, asked=frozenset()):
         for table, rid in [("messages", m["id"])] + [("quotes", q["id"]) for q in old]:
             conn.execute("UPDATE tasks SET status = 'dismissed', done_at = ? WHERE kind = 'review_quote' "
                          "AND ref_table = ? AND ref_id = ? AND status = 'pending'", (db.now(), table, rid))
+        bc = out.get("bank_change") if isinstance(out.get("bank_change"), dict) else {}
+        if bc.get("detected") is True:
+            _bank_task(conn, ps, m["id"], [str(bc.get("evidence") or "")], run_id)
         if flags:
             db.merge_supplier_specs(conn, ps["id"], flags, evidence)
             log("  🔎 공급처가 답한 사양 기록 (3번 참고): " + ", ".join(f"{k}={v}" for k, v in flags.items()))
@@ -440,19 +504,21 @@ def _save_analysis(conn, run_id, ps, m, out, asked=frozenset()):
             tiers = [{"qty": _int(t.get("qty")), "usd": usd(_num(t.get("price")))} for t in out.get("price_tiers") or []
                      if isinstance(t, dict) and _num(t.get("price")) is not None]
             inco = (out.get("incoterm") or "").upper()
-            vals = (price_usd, _int(out.get("min_qty")), db.dumps(tiers or None), inco if inco in INCOTERMS else None,
+            inco = inco if inco in INCOTERMS else None
+            vals = (price_usd, _int(out.get("min_qty")), db.dumps(tiers or None), inco, _place(out, inco),
                     _int(out.get("lead_time_days")), out.get("payment_terms"), usd(_num(out.get("sample_cost"))),
                     usd(_num(out.get("sample_shipping"))), out.get("valid_until"), fx_note)
-            cols = ("unit_price_usd, min_qty, price_tiers_json, incoterm, lead_time_days, payment_terms, "
+            cols = ("unit_price_usd, min_qty, price_tiers_json, incoterm, incoterm_place, lead_time_days, payment_terms, "
                     "sample_cost_usd, sample_shipping_usd, valid_until, notes")
+            marks = ", ".join("?" * len(vals))
             if old:
                 quote_id = old[0]["id"]
-                conn.execute(f"UPDATE quotes SET ({cols}) = (?, ?, ?, ?, ?, ?, ?, ?, ?, ?), run_id = ? WHERE id = ?",
+                conn.execute(f"UPDATE quotes SET ({cols}) = ({marks}), run_id = ? WHERE id = ?",
                              (*vals, run_id, quote_id))
             else:
                 quote_id = conn.execute(
                     f"INSERT INTO quotes (product_supplier_id, message_id, run_id, {cols})"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (ps["id"], m["id"], run_id, *vals)).lastrowid
+                    f" VALUES (?, ?, ?, {marks})", (ps["id"], m["id"], run_id, *vals)).lastrowid
             advance_ps_status(conn, ps["id"], "quoted")
             moq = f" / MOQ {_int(out.get('min_qty'))}" if out.get("min_qty") else ""
             orig = f" (원래 {price:g} {cur})" if fx_note else ""

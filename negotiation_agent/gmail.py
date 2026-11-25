@@ -62,7 +62,17 @@ def login():
         raise RuntimeError(f"OAuth 클라이언트 파일이 없습니다: {cred}\n"
                            "  Google Cloud 콘솔 → API 및 서비스 → 사용자 인증 정보 → OAuth 클라이언트 ID(데스크톱 앱) → JSON 다운로드")
     flow = InstalledAppFlow.from_client_secrets_file(str(cred), SCOPES)
-    creds = flow.run_local_server(port=0)
+    try:
+        creds = flow.run_local_server(port=0)
+    except Exception as err:          # oauthlib AccessDeniedError 등 — 트레이스백 대신 할 일을 알려 줌
+        if "access_denied" in str(err) or type(err).__name__ == "AccessDeniedError":
+            raise RuntimeError(
+                "구글이 로그인을 거부했습니다 (access_denied). 흔한 원인:\n"
+                "  1) 로그인 화면에서 '취소'·'뒤로'를 누름, 또는 권한 체크박스를 해제함 → 다시 실행해 모두 허용\n"
+                "  2) 앱이 '테스트' 상태인데 이 계정이 테스트 사용자에 없음 → Google Cloud 콘솔 → OAuth 동의 화면"
+                "(Google Auth Platform → 대상) → 테스트 사용자에 이 Gmail 추가, 또는 '프로덕션'으로 게시\n"
+                "  3) '확인되지 않은 앱' 경고에서 멈춤 → [고급] → (앱 이름)(으)로 이동") from err
+        raise
     _save_token(creds)
     me = _build(creds).users().getProfile(userId="me").execute().get("emailAddress")
     hub.log(f"Gmail 로그인 완료: {me}  (토큰: {token_path()})")

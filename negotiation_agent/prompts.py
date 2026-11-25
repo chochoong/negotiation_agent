@@ -15,7 +15,7 @@ Write a concise, professional first inquiry (RFQ) to an overseas supplier in {la
 Rules:
 """ + COMMON_RULES + """
 - Use 'product_en' as the product name in the message ('product_ko' is for your understanding only).
-- Ask clearly for: unit price (with price tiers if any), MOQ, lead time, payment terms, sample availability/cost,
+- Ask clearly for: unit price (with price tiers if any) and its Incoterm with the named place (e.g. FOB + port of loading), MOQ, lead time, payment terms, sample availability/cost,
   packaging details. Also ask every item in 'questions_to_ask' and 'unverified_points' naturally (merge duplicates).
 - If 'required_certifications' is given, ask whether they can provide those certificates/test reports.
 - 'product_spec_questions_ko' are product-specification questions from our customs/regulation check, written in
@@ -88,15 +88,19 @@ Return JSON only with these keys:
  "min_qty": integer|null,            // MOQ in pieces
  "price_tiers": [{"qty": integer, "price": number}],   // [] if none
  "incoterm": "EXW"|"FOB"|"CFR"|"CIF"|"DAP"|"DDP"|null,
+ "incoterm_place": str|null,         // the named place exactly as they wrote it with the Incoterm ("FOB Ningbo" -> "Ningbo"); null if not stated — never infer it from their country or city
  "lead_time_days": integer|null,     // convert weeks to days only if explicitly stated in weeks
  "payment_terms": str|null,
  "sample_cost": number|null,
  "sample_shipping": number|null,
  "valid_until": "YYYY-MM-DD"|null,
  "open_questions_ko": ["아직 답이 없는 항목이나 우리가 확인할 점"],
+ "bank_change": {"detected": true|false, "evidence": "the exact sentence(s) from the reply, or null"},
  "spec_answers": [{"flag": "...", "value": ..., "claim_ko": "공급처가 한 말 한국어 한 줄"}]
 }
 spec_answers: only for flags listed in the input 'spec_questions', and only when the supplier explicitly and clearly
 answered that point in this reply. 'value' must be one of that question's 'allowed_values' (true/false as JSON booleans).
 false means the supplier explicitly confirmed it does NOT apply (e.g. "no glue included"). If the answer is vague,
-conditional, or missing, leave that flag out — never infer from the product type. [] if none."""
+conditional, or missing, leave that flag out — never infer from the product type. [] if none.
+bank_change.detected: true if the reply gives bank / payment account details (beneficiary, account number, SWIFT, IBAN)
+or says their bank account changed, is new, or asks us to pay a different account. Otherwise false."""
